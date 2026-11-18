@@ -63,4 +63,8 @@ const (
 	K8sAPICallsTxTimeout    = 2 * time.Minute
 	ControlPlaneExecTimeOut = 5 * time.Minute
 	ReconcileTimeout        = 5 * time.Minute
+	// ModelRolloutRequeueInterval is used to requeue a Model that is being deleted while a new
+	// version is still rolling out. The old version must be kept serving until the scheduler reports
+	// the new version as ready, so the unload (and finalizer removal) are deferred.
+	ModelRolloutRequeueInterval = 10 * time.Second
 )

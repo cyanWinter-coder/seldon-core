@@ -261,3 +261,72 @@ func TestSubscribeModelEvents(t *testing.T) {
 		})
 	}
 }
+
+func TestSubscribeModelEventsGenerationGuard(t *testing.T) {
+	t.Parallel()
+
+	g := NewGomegaWithT(t)
+
+	// While a configuration update is being rolled out the scheduler can still stream status
+	// events for the previous generation. The operator must ignore them so a stale (e.g. Ready)
+	// state of the old version can not overwrite the progressing state of the new version.
+	existingModel := &mlopsv1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "foo",
+			Namespace:  "default",
+			Generation: 2,
+		},
+		Status: mlopsv1alpha1.ModelStatus{},
+	}
+
+	grpcClient := mockSchedulerGrpcClient{
+		responses_subscribe_models: []*scheduler.ModelStatusResponse{
+			{
+				ModelName: "foo",
+				Versions: []*scheduler.ModelVersionStatus{
+					{
+						KubernetesMeta: &scheduler.KubernetesMeta{
+							Namespace:  "default",
+							Generation: 1, // stale: model has already moved to generation 2
+						},
+						State: &scheduler.ModelStatus{
+							State:             scheduler.ModelStatus_ModelAvailable,
+							AvailableReplicas: 1,
+						},
+					},
+				},
+			},
+			{
+				ModelName: "foo",
+				Versions: []*scheduler.ModelVersionStatus{
+					{
+						KubernetesMeta: &scheduler.KubernetesMeta{
+							Namespace:  "default",
+							Generation: 2,
+						},
+						ServerName: "server",
+						State: &scheduler.ModelStatus{
+							State:               scheduler.ModelStatus_ModelProgressing,
+							AvailableReplicas:   0,
+							UnavailableReplicas: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	controller := newMockControllerClient(false, existingModel)
+	err := controller.SubscribeModelEvents(context.Background(), &grpcClient, "")
+	g.Expect(err).To(BeNil())
+
+	updated := &mlopsv1alpha1.Model{}
+	g.Expect(controller.Get(context.Background(),
+		client.ObjectKey{Name: "foo", Namespace: "default"}, updated)).To(BeNil())
+
+	// only the generation-2 event must have been applied: the model stays not ready
+	g.Expect(updated.Status.IsReady()).To(BeFalseBecause("stale generation event must be ignored"))
+	g.Expect(updated.Status.AvailableReplicas).To(Equal(int32(0)))
+	g.Expect(updated.Status.Replicas).To(Equal(int32(1)))
+	g.Expect(updated.Status.Selector).To(Equal("server=server"))
+}

@@ -56,6 +56,13 @@ Moreover, in many cases demand patterns allow for further Overcommit of resource
 
 See [Multi-model serving](mms/mms.md) for more information. 
 
+## Model Updates and Version Rollouts
+
+Updating a `Model` keeps the previously serving version available until the new version is ready,
+including when a version switch, an unready Server pod and a configuration update happen together.
+See the [Model resource reference](../kubernetes/resources/model/index.md#model-versioning-and-rollouts)
+for how scheduler model versions, the model finalizer and status events interact during a rollout.
+
 ## Autoscaling of Models
 
 See [here](../kubernetes/autoscaling/index.md) for discussion of autoscaling of models.

@@ -14,9 +14,11 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,7 +40,23 @@ type ModelReconciler struct {
 	Recorder  record.EventRecorder
 }
 
-func (r *ModelReconciler) handleFinalizer(ctx context.Context, logger logr.Logger, model *mlopsv1alpha1.Model) (bool, error) {
+// hasInProgressRollout reports whether the latest model version is still being rolled out while
+// an earlier version keeps serving traffic. The scheduler only streams the latest version's state
+// to the operator, so AvailableReplicas > 0 reflects replicas attached to the in-flight version and
+// a not-Ready ModelReady condition means it has not finished taking over. When a Model is deleted
+// during such a rollout (version switch, unready server pod and/or config update arriving together),
+// unloading now would let the scheduler drop the old, still-serving version before the new one is
+// ready. The decision is conservative: any uncertainty about the rollout state returns false and
+// deletion proceeds as before.
+func hasInProgressRollout(model *mlopsv1alpha1.Model) bool {
+	condition := model.Status.GetCondition(apis.ConditionReady)
+	if condition == nil || condition.Status == v1.ConditionTrue {
+		return false
+	}
+	return model.Status.AvailableReplicas > 0
+}
+
+func (r *ModelReconciler) handleFinalizer(ctx context.Context, logger logr.Logger, model *mlopsv1alpha1.Model) (bool, ctrl.Result, error) {
 
 	// Check if we are being deleted or not
 	if model.ObjectMeta.DeletionTimestamp.IsZero() { // Not being deleted
@@ -47,28 +65,50 @@ func (r *ModelReconciler) handleFinalizer(ctx context.Context, logger logr.Logge
 		if !utils.ContainsStr(model.ObjectMeta.Finalizers, constants.ModelFinalizerName) {
 			model.ObjectMeta.Finalizers = append(model.ObjectMeta.Finalizers, constants.ModelFinalizerName)
 			if err := r.Update(ctx, model); err != nil {
-				return true, err
+				return true, ctrl.Result{}, err
 			}
 		}
-	} else { // model is being deleted
-		if utils.ContainsStr(model.ObjectMeta.Finalizers, constants.ModelFinalizerName) {
-			// Handle unload in scheduler
-			if retryUnload, err := r.Scheduler.UnloadModel(ctx, model, nil); err != nil {
-				if retryUnload {
-					return true, err
-				} else {
-					model.ObjectMeta.Finalizers = utils.RemoveStr(model.ObjectMeta.Finalizers, constants.ModelFinalizerName)
-					if errUpdate := r.Update(ctx, model); errUpdate != nil {
-						logger.Error(err, "Failed to remove finalizer", "model", model.Name)
-						return true, err
-					}
+		return false, ctrl.Result{}, nil
+	}
+
+	// model is being deleted
+	if utils.ContainsStr(model.ObjectMeta.Finalizers, constants.ModelFinalizerName) {
+		// Keep the previous model version serving while the new version is still rolling out.
+		// The scheduler retains old versions until the latest one is available, but the operator
+		// owns the unload request triggered by deletion; deferring it here avoids racing the
+		// scheduler cleanup and dropping the only live replicas. Reconciliation is requeued so the
+		// unload is retried once the rollout completes.
+		if hasInProgressRollout(model) {
+			logger.Info(
+				"Deferring model unload while a new version is still rolling out",
+				"model", model.Name,
+				"availableReplicas", model.Status.AvailableReplicas,
+			)
+			r.Recorder.Eventf(
+				model,
+				v1.EventTypeNormal,
+				"ModelRolloutInProgress",
+				"Deferring unload of Model %q: a new version is still rolling out",
+				model.Name,
+			)
+			return true, ctrl.Result{RequeueAfter: constants.ModelRolloutRequeueInterval}, nil
+		}
+
+		// Handle unload in scheduler
+		if retryUnload, err := r.Scheduler.UnloadModel(ctx, model, nil); err != nil {
+			if retryUnload {
+				return true, ctrl.Result{}, err
+			} else {
+				model.ObjectMeta.Finalizers = utils.RemoveStr(model.ObjectMeta.Finalizers, constants.ModelFinalizerName)
+				if errUpdate := r.Update(ctx, model); errUpdate != nil {
+					logger.Error(err, "Failed to remove finalizer", "model", model.Name)
+					return true, ctrl.Result{}, err
 				}
 			}
 		}
-		// Stop reconciliation as the item is being deleted
-		return true, nil
 	}
-	return false, nil
+	// Stop reconciliation as the item is being deleted
+	return true, ctrl.Result{}, nil
 }
 
 //+kubebuilder:rbac:groups=mlops.seldon.io,resources=models,verbs=get;list;watch;create;update;patch;delete
@@ -98,9 +138,9 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return reconcile.Result{}, err
 	}
 
-	stop, err := r.handleFinalizer(ctx, logger, model)
+	stop, result, err := r.handleFinalizer(ctx, logger, model)
 	if stop {
-		return reconcile.Result{}, err
+		return result, err
 	}
 
 	retry, err := r.Scheduler.LoadModel(ctx, model, nil)

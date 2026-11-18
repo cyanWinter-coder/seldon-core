@@ -67,6 +67,19 @@ func (v *VersionCleaner) cleanupOldVersions(modelName string) error {
 	}
 	if latest.ModelState().State == store.ModelAvailable {
 		for _, mv := range model.GetVersionsBeforeLastAvailable() {
+			// An earlier version can still be serving live replicas while the latest version is
+			// transitioning (for example when a model version switch, an unready server pod and a
+			// configuration update happen close together). Unloading it now would remove the only
+			// replicas able to receive traffic, so keep it until the latest version has fully taken
+			// over. Cleanup is re-triggered on every Envoy model sync, so the retained version will
+			// be unloaded on a later pass once its replicas are gone.
+			if mv.HasLiveReplicas() {
+				logger.Debugf(
+					"Retaining model %s version %d as it still has live replicas while latest version %d is rolling out",
+					modelName, mv.GetVersion(), latest.GetVersion(),
+				)
+				continue
+			}
 			_, err := v.store.UnloadVersionModels(modelName, mv.GetVersion())
 			if err != nil {
 				return err
